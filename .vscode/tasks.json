@@ -1,0 +1,132 @@
+{
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "build_env",
+            "command": "mkdir -p /home/hututuzi/pgsql && mkdir -p /home/hututuzi/pgdata",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task add folders."
+        },
+        {
+            "type": "shell",
+            "label": "build_config",
+            "command": "./configure",
+            "args": [
+                "--prefix=/home/hututuzi/pgsql",
+                "--with-icu",
+                "--with-openssl",
+                "--with-systemd",
+                "--with-libxml",
+                "--enable-debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task Build MakeFile."
+        },
+        {
+            "type": "shell",
+            "label": "make",
+            "command": "make",
+            "args": [
+                "-j12"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task build."
+        },
+        {
+            "type": "shell",
+            "label": "make_install",
+            "command": "make",
+            "args": [
+                "install"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task install database."
+        },
+        {
+            "type": "shell",
+            "label": "init_db",
+            "command": "initdb",
+            "args": [
+                "-D",
+                "/home/hututuzi/pgdata"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task init default database."
+        },
+        {
+            "type": "shell",
+            "label": "clean_db",
+            "command": "make uninstall && make clean && rm -rf /home/hututuzi/pgsql",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "detail": "Task clean database."
+        },
+        {
+            "type": "shell",
+            "label": "build_db_conf",
+            "dependsOn": [
+                "build_config"
+            ],
+            "dependsOrder": "sequence",
+            "detail": "Task add folders."
+        },
+        {
+            "type": "shell",
+            "label": "build_db",
+            "dependsOn": [
+                "make",
+                "make_install",
+                "init_db"
+            ],
+            "dependsOrder": "sequence",
+            "detail": "Task add folders."
+        },
+        {
+            "type": "shell",
+            "label": "rebuild_db",
+            "dependsOn": [
+                "make",
+                "make_install"
+            ],
+            "dependsOrder": "sequence",
+            "detail": "Task add folders.",
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "type": "cppbuild",
+            "label": "C/C++: gcc-13 build active file",
+            "command": "/usr/bin/gcc-13",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": "build",
+            "detail": "compiler: /usr/bin/gcc-13"
+        }
+    ],
+    "version": "2.0.0"
+}

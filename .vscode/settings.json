@@ -1,0 +1,31 @@
+{
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
+    "files.associations": {
+        "rewritemanip.h": "c",
+        "typeinfo": "c",
+        "chrono": "c",
+        "relcache.h": "c",
+        "pg_config_ext.h": "c",
+        "toast_helper.h": "c",
+        "genam.h": "c",
+        "rel.h": "c",
+        "random": "c",
+        "queue": "c",
+        "stack": "c",
+        "fmgroids.h": "c",
+        "timestamp.h": "c",
+        "itemptr.h": "c",
+        "index.h": "c",
+        "htup_details.h": "c",
+        "xloginsert.h": "c",
+        "heaptoast.h": "c",
+        "heapam_xlog.h": "c",
+        "rewriteheap.h": "c",
+        "tuple": "c",
+        "__tuple": "c",
+        "postgres.h": "c",
+        "relation.h": "c",
+        "pg_class.h": "c"
+    }
+}
+
