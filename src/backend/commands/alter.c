@@ -1110,17 +1110,41 @@ void ATExecEnableDeleteBackup(Relation rel)
 					   0);
 
 	/* 创建备份表 */
-	backupTableOid = heap_create_with_catalog(backupTableName,
-											  RelationGetNamespace(rel),
-											  InvalidOid,
-											  rel->rd_rel->relowner,
-											  backupDesc,
-											  NIL,
-											  RELKIND_RELATION,
-											  rel->rd_rel->relpersistence,
-											  false,
-											  ONCOMMIT_NOOP,
-											  NULL);
+	// backupTableOid = heap_create_with_catalog(backupTableName,
+	// 										  RelationGetNamespace(rel),
+	// 										  InvalidOid,
+	// 										  rel->rd_rel->relowner,
+	// 										  backupDesc,
+	// 										  NIL,
+	// 										  RELKIND_RELATION,
+	// 										  rel->rd_rel->relpersistence,
+	// 										  false,
+	// 										  ONCOMMIT_NOOP,
+	// 										  NULL);
+	/* 创建备份表 */
+    backupTableOid = heap_create_with_catalog(
+        backupTableName,                    // 备份表名
+        RelationGetNamespace(rel),          // 原表的命名空间
+        InvalidOid,                          // 表空间
+        InvalidOid,                          // 备份表的 OID
+        InvalidOid,                          // 备份表的类型 OID
+        InvalidOid,                          // 不属于任何类型
+        rel->rd_rel->relowner,              // 原表的所有者
+        rel->rd_rel->relpersistence,        // 原表的持久性
+        backupDesc,                          // 备份表的列描述符
+        NIL,                                 // 约束信息
+        RELKIND_RELATION,                   // 表类型
+        rel->rd_rel->relpersistence,        // 持久性
+        false,                               // 非共享表
+        false,                               // 非映射表
+        ONCOMMIT_NOOP,                      // 提交后行为
+        NULL,                                // 表选项
+        false,                               // 使用默认的 ACL
+        false,                               // 不允许系统表修改
+        false,                               // 非内部表
+        InvalidOid,                          // 重写表（不使用）
+        NULL                                 // 返回类型地址
+    );
 
 	/* 修改 pg_class，设置 relbackup 字段 */
 	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
