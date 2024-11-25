@@ -1096,7 +1096,7 @@ void ATExecEnableDeleteBackup(Relation rel)
 	/* 创建备份表的描述符 */
 	backupDesc = CreateTemplateTupleDesc(origDesc->natts + 1);
 
-	for (int i = 0; i < origDesc->natts; i++)
+	for (int i = 1; i <= origDesc->natts; i++)
 	{
 		TupleDescCopyEntry(backupDesc, i, origDesc, i);
 	}
