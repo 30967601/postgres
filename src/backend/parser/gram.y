@@ -2591,32 +2591,14 @@ alter_table_cmd:
 				}
 			| ENABLE_P DELETEBACKUP
 			{
-				AlterTableStmt *n = makeNode(AlterTableStmt);
-				AlterTableCmd *m = makeNode(AlterTableCmd);
-
-				m->subtype = AT_EnableDeleteBackup; 
-				m->def = NULL;
-
-				n->cmds = list_make1(m);
-
-				n->relation = makeRangeVar(NULL, $2, -1);
-				n->relkind = OBJECT_TABLE;
-				n->missing_ok = $1;
+				AlterTableCmd *n = makeNode(AlterTableCmd);
+				n->subtype = AT_EnableDeleteBackup; 
 				$$ = (Node *) n;
 			}
 			| DISABLE_P DELETEBACKUP
 			{
-				AlterTableStmt *n = makeNode(AlterTableStmt);
-				AlterTableCmd *m = makeNode(AlterTableCmd);
-
-				m->subtype = AT_DisableDeleteBackup; 
-				m->def = NULL;
-
-				n->cmds = list_make1(m);
-
-				n->relation = makeRangeVar(NULL, $2, -1);
-				n->relkind = OBJECT_TABLE;
-				n->missing_ok = $1;
+				AlterTableCmd *n = makeNode(AlterTableCmd);
+				n->subtype = AT_DisableDeleteBackup; 
 				$$ = (Node *) n;
 			}
 		;
