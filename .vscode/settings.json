@@ -28,7 +28,8 @@
         "pg_class.h": "c",
         "objectaccess.h": "c",
         "dependency.h": "c",
-        "objectaddress.h": "c"
+        "objectaddress.h": "c",
+        "pg_aggregate.h": "c"
     }
 }
 

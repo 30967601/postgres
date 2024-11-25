@@ -4075,6 +4075,12 @@ AlterTableGetLockLevel(List *cmds)
 				 */
 				cmd_lockmode = AccessShareLock;
 				break;
+			case AT_EnableDeleteBackup:
+				cmd_lockmode = AccessExclusiveLock;
+				break;
+			case AT_DisableDeleteBackup:
+				cmd_lockmode = AccessExclusiveLock;
+				break;
 
 			default:			/* oops */
 				elog(ERROR, "unrecognized alter table type: %d",
@@ -4446,6 +4452,14 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_DetachPartition:
 			ATSimplePermissions(rel, ATT_TABLE);
 			/* No command-specific prep needed */
+			pass = AT_PASS_MISC;
+			break;
+		case AT_EnableDeleteBackup:
+			ATSimplePermissions(rel, ATT_TABLE | ATT_PARTITIONED_INDEX);
+			pass = AT_PASS_MISC;
+			break;
+		case AT_DisableDeleteBackup:
+			ATSimplePermissions(rel, ATT_TABLE | ATT_PARTITIONED_INDEX);
 			pass = AT_PASS_MISC;
 			break;
 		default:				/* oops */
