@@ -653,6 +653,7 @@ DefineQueryRewrite(const char *rulename,
 		classForm->reltuples = 0;
 		classForm->relallvisible = 0;
 		classForm->reltoastrelid = InvalidOid;
+		classForm->relbackup = InvalidOid;
 		classForm->relhasindex = false;
 		classForm->relkind = RELKIND_VIEW;
 		classForm->relfrozenxid = InvalidTransactionId;

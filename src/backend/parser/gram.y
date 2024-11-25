@@ -643,7 +643,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
 
 	DATA_P DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS
-	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DEPENDS DESC
+	DEFERRABLE DEFERRED DEFINER DELETE_P DELETEBACKUP DELIMITER DELIMITERS DEPENDS DESC
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
@@ -2203,13 +2203,13 @@ alter_table_cmd:
 				}
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET STORAGE <storagemode> */
 			| ALTER opt_column ColId SET STORAGE ColId
-				{
+			{
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 					n->subtype = AT_SetStorage;
 					n->name = $3;
 					n->def = (Node *) makeString($6);
 					$$ = (Node *)n;
-				}
+			}
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> ADD GENERATED ... AS IDENTITY ... */
 			| ALTER opt_column ColId ADD_P GENERATED generated_when AS IDENTITY_P OptParenthesizedSeqOptList
 				{
@@ -2589,6 +2589,36 @@ alter_table_cmd:
 					n->def = (Node *)$1;
 					$$ = (Node *) n;
 				}
+			| ENABLE_P DELETEBACKUP
+			{
+				AlterTableStmt *n = makeNode(AlterTableStmt);
+				AlterTableCmd *m = makeNode(AlterTableCmd);
+
+				m->subtype = AT_EnableDeleteBackup; 
+				m->def = NULL;
+
+				n->cmds = list_make1(m);
+
+				n->relation = makeRangeVar(NULL, $2, -1);
+				n->relkind = OBJECT_TABLE;
+				n->missing_ok = $1;
+				$$ = (Node *) n;
+			}
+			| DISABLE_P DELETEBACKUP
+			{
+				AlterTableStmt *n = makeNode(AlterTableStmt);
+				AlterTableCmd *m = makeNode(AlterTableCmd);
+
+				m->subtype = AT_DisableDeleteBackup; 
+				m->def = NULL;
+
+				n->cmds = list_make1(m);
+
+				n->relation = makeRangeVar(NULL, $2, -1);
+				n->relkind = OBJECT_TABLE;
+				n->missing_ok = $1;
+				$$ = (Node *) n;
+			}
 		;
 
 alter_column_default:
@@ -15330,6 +15360,7 @@ unreserved_keyword:
 			| DEFERRED
 			| DEFINER
 			| DELETE_P
+			| DELETEBACKUP
 			| DELIMITER
 			| DELIMITERS
 			| DEPENDS

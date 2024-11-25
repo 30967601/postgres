@@ -25,7 +25,10 @@
         "__tuple": "c",
         "postgres.h": "c",
         "relation.h": "c",
-        "pg_class.h": "c"
+        "pg_class.h": "c",
+        "objectaccess.h": "c",
+        "dependency.h": "c",
+        "objectaddress.h": "c"
     }
 }
 

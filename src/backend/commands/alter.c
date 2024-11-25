@@ -1072,3 +1072,96 @@ AlterObjectOwner_internal(Relation rel, Oid objectId, Oid new_ownerId)
 
 	InvokeObjectPostAlterHook(classId, objectId, 0);
 }
+void ATExecEnableDeleteBackup(Relation rel)
+{
+	char *backupTableName;
+	Oid backupTableOid;
+	Relation backupRel;
+	TupleDesc origDesc;
+	TupleDesc backupDesc;
+	HeapTuple classTup;
+
+	/* 检查是否已经启用了 DELETEBACKUP */
+	if (RelationGetRelbackup(rel) != InvalidOid)
+		ereport(ERROR,
+				(errmsg("DELETEBACKUP is already enabled on table \"%s\"",
+						RelationGetRelationName(rel))));
+
+	/* 生成备份表名 */
+	backupTableName = psprintf("%s_backup", RelationGetRelationName(rel));
+
+	/* 获取原表描述符 */
+	origDesc = RelationGetDescr(rel);
+
+	/* 创建备份表的描述符 */
+	backupDesc = CreateTemplateTupleDesc(origDesc->natts + 1);
+
+	for (int i = 0; i < origDesc->natts; i++)
+	{
+		TupleDescCopyEntry(backupDesc, i, origDesc, i);
+	}
+
+	/* 添加 pg_del_ts 列 */
+	TupleDescInitEntry(backupDesc,
+					   backupDesc->natts - 1,
+					   "pg_del_ts",
+					   TIMESTAMPTZOID,
+					   -1,
+					   0);
+
+	/* 创建备份表 */
+	backupTableOid = heap_create_with_catalog(backupTableName,
+											  RelationGetNamespace(rel),
+											  InvalidOid,
+											  rel->rd_rel->relowner,
+											  backupDesc,
+											  NIL,
+											  RELKIND_RELATION,
+											  rel->rd_rel->relpersistence,
+											  false,
+											  ONCOMMIT_NOOP,
+											  NULL);
+
+	/* 修改 pg_class，设置 relbackup 字段 */
+	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
+	if (!HeapTupleIsValid(classTup))
+		elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(rel));
+
+	((Form_pg_class)GETSTRUCT(classTup))->relbackup = backupTableOid;
+
+	/* 更新 pg_class */
+	CatalogTupleUpdate(RelationGetRelid(rel), &classTup->t_self, classTup);
+
+	/* 释放内存 */
+	heap_freetuple(classTup);
+	table_close(rel, RowExclusiveLock);
+}
+
+void ATExecDisableDeleteBackup(Relation rel){
+	Oid backupTableOid;
+	HeapTuple classTup;
+
+	/* 检查是否启用了 DELETEBACKUP */
+	backupTableOid = RelationGetRelbackup(rel);
+	if (backupTableOid == InvalidOid)
+		ereport(ERROR,
+				(errmsg("DELETEBACKUP is not enabled on table \"%s\"",
+						RelationGetRelationName(rel))));
+
+	/* 删除备份表 */
+	ObjectAddress backupTableAddr = {RelationRelationId, backupTableOid};
+	performDeletion(&backupTableAddr, DROP_CASCADE, 0);
+
+	/* 修改 pg_class 清空 relbackup 字段 */
+	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
+	if (!HeapTupleIsValid(classTup))
+		elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(rel));
+
+	((Form_pg_class)GETSTRUCT(classTup))->relbackup = InvalidOid;
+
+	/* 更新 pg_class */
+	CatalogTupleUpdate(RelationGetRelid(rel), &classTup->t_self, classTup);
+
+	/* 释放内存 */
+	heap_freetuple(classTup);
+}

@@ -25,7 +25,7 @@
  *		careful....
  */
 #include "postgres.h"
-
+#include "catalog/pg_class.h"
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1950,6 +1950,7 @@ formrdesc(const char *relationName, Oid relationReltype,
 	relation->rd_rel->reltuples = 0;
 	relation->rd_rel->relallvisible = 0;
 	relation->rd_rel->relkind = RELKIND_RELATION;
+	relation->rd_rel->relbackup = InvalidOid;
 	relation->rd_rel->relnatts = (int16) natts;
 	relation->rd_rel->relam = HEAP_TABLE_AM_OID;
 
@@ -6525,4 +6526,13 @@ unlink_initfile(const char *initfilename, int elevel)
 					 errmsg("could not remove cache file \"%s\": %m",
 							initfilename)));
 	}
+}
+Oid
+RelationGetRelbackup(Relation rel)
+{
+    /* 确保 Relation 的元数据存在 */
+    Assert(rel->rd_rel != NULL);
+
+    /* 返回 relbackup 字段 */
+    return rel->rd_rel->relbackup;
 }

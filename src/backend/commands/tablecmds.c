@@ -4846,6 +4846,12 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			Assert(rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 			ATExecDetachPartition(rel, ((PartitionCmd *) cmd->def)->name);
 			break;
+		case AT_EnableDeleteBackup:
+		    ATExecEnableDeleteBackup(rel);
+  			break;
+		case AT_DisableDeleteBackup:
+			ATExecDisableDeleteBackup(rel);
+			break;
 		default:				/* oops */
 			elog(ERROR, "unrecognized alter table type: %d",
 				 (int) cmd->subtype);
