@@ -147,6 +147,5 @@ extern bool criticalRelcachesBuilt;
 /* should be used only by relcache.c and postinit.c */
 extern bool criticalSharedRelcachesBuilt;
 
-extern Oid RelationGetRelbackup(Relation rel);
 
 #endif							/* RELCACHE_H */

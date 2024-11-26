@@ -318,6 +318,8 @@ static void RangeVarCallbackForTruncate(const RangeVar *relation,
 										Oid relId, Oid oldRelId, void *arg);
 static List *MergeAttributes(List *schema, List *supers, char relpersistence,
 							 bool is_partition, List **supconstr);
+static List *MergeAttributesForArchive(List *schema, List *supers, char relpersistence,
+							 		   bool is_partition);
 static bool MergeCheckConstraint(List *constraints, char *name, Node *expr);
 static void MergeAttributesIntoExisting(Relation child_rel, Relation parent_rel);
 static void MergeConstraintsIntoExisting(Relation child_rel, Relation parent_rel);
@@ -569,13 +571,6 @@ static void refuseDupeIndexAttach(Relation parentIdx, Relation partIdx,
 static List *GetParentedForeignKeyRefs(Relation partition);
 static void ATDetachCheckNoForeignKeyRefs(Relation partition);
 
-
-static void ATExecEnableDeleteBackup(Relation rel);
-static void ATExecDisableDeleteBackup(Relation rel);
-static Oid DefineArchiveRelation(Relation rel);
-static List *
-MergeAttributesForArchive(List *schema, List *supers, char relpersistence,
-						  bool is_partition);
 
 /* ----------------------------------------------------------------
  *		DefineRelation
@@ -916,7 +911,10 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 										  allowSystemTableMods,
 										  false,
 										  InvalidOid,
-										  typaddress);
+										  typaddress,
+										  false, /* isarchive */
+										  false  /* istminmap */
+										  );
 
 	/*
 	 * We must bump the command counter to make the newly-created relation
@@ -2860,6 +2858,183 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 	return schema;
 }
 
+static List *
+MergeAttributesForArchive(List *schema, List *supers, char relpersistence,
+						  bool is_partition)
+{
+	List	   *inhSchema = NIL;
+	int			child_attno;
+	ListCell   *entry;
+	/*
+	 * Check for and reject tables with too many columns. We perform this
+	 * check relatively early for two reasons: (a) we don't run the risk of
+	 * overflowing an AttrNumber in subsequent code (b) an O(n^2) algorithm is
+	 * okay if we're processing <= 1600 columns, but could take minutes to
+	 * execute if the user attempts to create a table with hundreds of
+	 * thousands of columns.
+	 *
+	 * Note that we also need to check that we do not exceed this figure after
+	 * including columns from inherited relations.
+	 * 
+	 * it also check when creating current table
+	 * 
+	 * considering pg_tmin, pg_tmax columns, we can only have at most MaxHeapAttributeNumber - 2 columns
+	 */
+	if (list_length(schema) > MaxHeapAttributeNumber - 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_TOO_MANY_COLUMNS),
+				 errmsg("if you want to enable flashback, tables can have at most %d columns",
+						MaxHeapAttributeNumber - 2)));
+	/*
+	 * Scan the parents left-to-right, and merge their attributes to form a
+	 * list of inherited attributes (inhSchema).  Also check to see if we need
+	 * to inherit an OID column.
+	 */
+	child_attno = 0;
+	foreach(entry, supers)
+	{
+		Oid			parent = lfirst_oid(entry);
+		Relation	relation;
+		TupleDesc	tupleDesc;
+		AttrMap    *newattmap;
+		AttrNumber	parent_attno;
+		/* caller already got lock */
+		relation = table_open(parent, NoLock);
+		/*
+		 * We do not allow partitioned tables to participate in
+		 * regular inheritance.
+		 * 
+		 * currently support partitions and normal table to enable flashback
+		 */
+		if (relation->rd_rel->relkind != RELKIND_RELATION)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("currently, only allow normal tables and partitions to enable flashback")));
+		/* 
+		 * Permanent rels cannot inherit from temporary ones
+		 *
+		 * currently, dont care about this check
+		 */
+		if (relpersistence != RELPERSISTENCE_TEMP &&
+			relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg(!is_partition
+							? "cannot inherit from temporary relation \"%s\""
+							: "cannot create a permanent relation as partition of temporary relation \"%s\"",
+							RelationGetRelationName(relation))));
+		/*
+		 * We should have an UNDER permission flag for this, but for now,
+		 * demand that creator of a child table own the parent.
+		 */
+		if (!pg_class_ownercheck(RelationGetRelid(relation), GetUserId()))
+			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(relation->rd_rel->relkind),
+						   RelationGetRelationName(relation));
+		tupleDesc = RelationGetDescr(relation);
+		/*
+		 * newattmap->attnums[] will contain the child-table attribute numbers
+		 * for the attributes of this parent table.  (They are not the same
+		 * for parents after the first one, nor if we have dropped columns.)
+		 */
+		newattmap = make_attrmap(tupleDesc->natts);
+
+		for (parent_attno = 1; parent_attno <= tupleDesc->natts;
+			 parent_attno++)
+		{
+			Form_pg_attribute attribute = TupleDescAttr(tupleDesc,
+														parent_attno - 1);
+			char	   *attributeName = NameStr(attribute->attname);
+			ColumnDef  *def;
+			/*
+			 * Ignore dropped columns in the parent.
+			 */
+			if (attribute->attisdropped)
+				continue;		/* leave newattmap->attnums entry as zero */
+			/*
+			 *create a new inherited column
+			 */
+			{
+				def = makeNode(ColumnDef);
+				def->colname = pstrdup(attributeName);
+				def->typeName = makeTypeNameFromOid(attribute->atttypid,
+													attribute->atttypmod);
+				def->inhcount = 0;
+				def->is_local = true;
+				def->is_not_null = false;
+				def->is_from_type = false;
+				def->storage = 0;
+				def->raw_default = NULL;
+				def->cooked_default = NULL;
+				def->generated = 0;
+				def->collClause = NULL;
+				def->collOid = InvalidOid;
+				def->constraints = NIL;
+				def->location = -1;
+				inhSchema = lappend(inhSchema, def);
+				newattmap->attnums[parent_attno - 1] = ++child_attno;
+			}
+		}
+		/*
+		 * Now copy the CHECK constraints of this parent, adjusting attnos
+		 * using the completed newattmap map.  Identically named constraints
+		 * are merged if possible, else we throw error.
+		 * 
+		 * we dont copy any constraints from current table.
+		 */
+		free_attrmap(newattmap);
+		/*
+		 * Close the parent rel, but keep our lock on it until xact commit.
+		 * That will prevent someone else from deleting or ALTERing the parent
+		 * before the child is committed.
+		 */
+		table_close(relation, NoLock);
+	}
+	/*
+	 * If we had no inherited attributes, the result schema is just the
+	 * explicitly declared columns.  Otherwise, we need to merge the declared
+	 * columns into the inherited schema list.  
+	 */
+	if (inhSchema != NIL)
+	{
+		int			schema_attno = 0;
+		/* should ignore this loop */
+		foreach(entry, schema)
+		{
+			ColumnDef  *newdef = lfirst(entry);
+			char	   *attributeName = newdef->colname;
+			int			exist_attno;
+			schema_attno++;
+			/*
+			 * Does it conflict with some previously inherited column?
+			 */
+			exist_attno = findAttrByName(attributeName, inhSchema);
+			if (exist_attno > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+					 	 errmsg("table columns should not contain pg_tmin, pg_tmax")));
+			{
+				/*
+				 * assume that added columns (pg_tmin and pg_tmax) never conflict with current table
+				 */
+				inhSchema = lappend(inhSchema, newdef);
+			}
+		}
+		/* directly copy inhSchema */
+		schema = inhSchema;
+		/*
+		 * Check that we haven't exceeded the legal # of columns after merging
+		 * in inherited columns.
+		 */
+		if (list_length(schema) > MaxHeapAttributeNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_COLUMNS),
+					 errmsg("tables can have at most %d columns",
+							MaxHeapAttributeNumber)));
+	}
+	/* no need to overwrite constraints */
+	// *supconstr = constraints;
+	return schema;
+}
 
 /*
  * MergeCheckConstraint
@@ -3951,6 +4126,8 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_DropIdentity:
 			case AT_SetIdentity:
 			case AT_DropExpression:
+			case AT_EnableFlashback:
+			case AT_DisableFlashback:
 				cmd_lockmode = AccessExclusiveLock;
 				break;
 
@@ -4081,12 +4258,6 @@ AlterTableGetLockLevel(List *cmds)
 				 * strong enough to prevent concurrent DROP NOT NULL.
 				 */
 				cmd_lockmode = AccessShareLock;
-				break;
-			case AT_EnableDeleteBackup:
-				cmd_lockmode = AccessExclusiveLock;
-				break;
-			case AT_DisableDeleteBackup:
-				cmd_lockmode = AccessExclusiveLock;
 				break;
 
 			default:			/* oops */
@@ -4441,6 +4612,8 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_DisableRowSecurity:
 		case AT_ForceRowSecurity:
 		case AT_NoForceRowSecurity:
+		case AT_EnableFlashback:
+		case AT_DisableFlashback:
 			ATSimplePermissions(rel, ATT_TABLE);
 			/* These commands never recurse */
 			/* No command-specific prep needed */
@@ -4459,14 +4632,6 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_DetachPartition:
 			ATSimplePermissions(rel, ATT_TABLE);
 			/* No command-specific prep needed */
-			pass = AT_PASS_MISC;
-			break;
-		case AT_EnableDeleteBackup:
-			ATSimplePermissions(rel, ATT_TABLE);
-			pass = AT_PASS_MISC;
-			break;
-		case AT_DisableDeleteBackup:
-			ATSimplePermissions(rel, ATT_TABLE);
 			pass = AT_PASS_MISC;
 			break;
 		default:				/* oops */
@@ -4846,6 +5011,12 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		case AT_NoForceRowSecurity:
 			ATExecForceNoForceRowSecurity(rel, false);
 			break;
+		case AT_EnableFlashback:
+			ATExecEnableFlashback(rel);
+			break;
+		case AT_DisableFlashback:
+			ATExecDisableFlashback(rel);
+			break;
 		case AT_GenericOptions:
 			ATExecGenericOptions(rel, (List *) cmd->def);
 			break;
@@ -4866,12 +5037,6 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			/* ATPrepCmd ensures it must be a table */
 			Assert(rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 			ATExecDetachPartition(rel, ((PartitionCmd *) cmd->def)->name);
-			break;
-		case AT_EnableDeleteBackup:
-		    ATExecEnableDeleteBackup(rel);
-  			break;
-		case AT_DisableDeleteBackup:
-			ATExecDisableDeleteBackup(rel);
 			break;
 		default:				/* oops */
 			elog(ERROR, "unrecognized alter table type: %d",
@@ -15236,6 +15401,727 @@ ATExecDisableRowSecurity(Relation rel)
 	heap_freetuple(tuple);
 }
 
+Oid
+DefineArchiveRelation(Relation rel)
+{
+	/* enable flashback means we need to create history table for this relation */
+	ObjectAddress address;
+	char		relname[NAMEDATALEN];
+	Oid			namespaceId = InvalidOid;
+	List	   *inheritOids = NIL;
+	Oid 		tablespaceId = InvalidOid;
+	Oid         ownerId = InvalidOid;
+	Datum       reloptions = (Datum) 0;
+	Datum		toast_options = (Datum) 0;
+	Oid         ofTypeId = InvalidOid;
+	List       *tableElts = NIL;
+	List	   *constraints = NIL;
+	TupleDesc	descriptor = NULL;
+	List	   *cookedDefaults = NIL;
+	const char *accessMethod = NULL;
+	Oid			accessMethodId = InvalidOid;
+	Oid			relationId = InvalidOid;
+	ColumnDef  *tminDef = NULL;
+	ColumnDef  *tmaxDef = NULL;
+	List       *options = NIL;
+	DefElem    *option = NULL;
+	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
+
+	/* if already enabled, no need to enable again */
+	if (rel->rd_rel->relarchiverelid != InvalidOid) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WARNING),
+				 errmsg("already enable flashback")));
+	}
+	/* cannot enable flashback for one history table */
+	if (rel->rd_rel->relisarchive) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot enable flashback for one history table")));
+	}
+	/* cannot enable flashback for one tminmap table */
+	if (rel->rd_rel->relistminmap) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot enable flashback for one tminmap table")));
+	}
+	/*
+	 * Create the history table name
+	 */
+	snprintf(relname, sizeof(relname), "pg_archive_%u", rel->rd_id);
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("temp table can not enable flashback")));
+	}
+	if (rel->rd_rel->relkind != RELKIND_RELATION) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("only partitions and normal tables can enable flashback")));
+	}
+	/* current table and history table should be in the same namespace */
+	namespaceId = RelationGetNamespace(rel);
+	/* add current table oid to parent id, so we can inherit its attrs to history table*/
+	inheritOids = lappend_oid(inheritOids, RelationGetRelid(rel));
+	/* history table's tablespaceId should be the same with current table */
+	Assert(list_length(inheritOids) == 1);
+	tablespaceId = get_rel_tablespace(linitial_oid(inheritOids));
+	/* Check permissions except when using database's default */
+	if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
+	{
+		AclResult	aclresult;
+		aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(),
+										   ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_TABLESPACE,
+						   get_tablespace_name(tablespaceId));
+	}
+	/* 
+	 * In all cases disallow placing user relations in pg_global 
+	 * actually current table cannot be in pg_global, so history table shouldn't be in pg_global 
+	 */
+	if (tablespaceId == GLOBALTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("only shared relations can be placed in pg_global tablespace")));
+	/* Identify user ID that will own the relation */
+	ownerId = GetUserId();
+	/* Permissions checks */
+	if (!pg_class_ownercheck(RelationGetRelid(rel), ownerId))
+		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
+					   RelationGetRelationName(rel));
+	/*
+	 * Parse and validate reloptions, if any. we can set empty here because alter dont pass any options
+	 */
+	{
+		Value *arg = makeNode(Value);
+		arg->type = T_String;
+		(arg->val).str = "false";
+
+		option = makeNode(DefElem);
+		option->type = T_DefElem;
+		option->defnamespace = NULL;
+		option->defname = "autovacuum_enabled";
+		option->defaction = DEFELEM_UNSPEC;
+		option->location = -1;
+		option->arg = (Node *)arg;
+	}
+	options = lappend(options, option);
+	reloptions = transformRelOptions((Datum) 0, options, NULL, validnsps,
+									 true, false);
+	(void) heap_reloptions(RELKIND_RELATION, reloptions, true); 
+	/* 
+	 * copy current table oftype to history table
+	 * if dont permit InvalidOid ofTypeId, it will occur error when creating current table
+	 * so we dont need to check ofTypeId 
+	 */
+	ofTypeId = rel->rd_rel->reloftype;
+
+	/* add tmin column */	
+	{
+		tminDef = makeNode(ColumnDef);
+		tminDef->type = T_ColumnDef;
+		tminDef->colname = pstrdup("pg_tmin");
+		tminDef->typeName = SystemTypeName("timestamptz");
+		tminDef->inhcount = 0;
+		tminDef->is_local = true;
+		tminDef->is_not_null = false;
+		tminDef->is_from_type = false;
+		tminDef->storage = 0;
+		tminDef->raw_default = NULL;
+		tminDef->cooked_default = NULL;
+		tminDef->identity = 0;
+		tminDef->identitySequence = NULL;
+		tminDef->generated = 0;
+		tminDef->collClause = NULL;
+		tminDef->collOid = InvalidOid;
+		tminDef->constraints = NIL;
+		tminDef->fdwoptions = NIL;
+		tminDef->location = -1;
+	}
+	/* add tmax column */
+	{
+		tmaxDef = makeNode(ColumnDef);
+		tmaxDef->type = T_ColumnDef;
+		tmaxDef->colname = pstrdup("pg_tmax");
+		tmaxDef->typeName = SystemTypeName("timestamptz");
+		tmaxDef->inhcount = 0;
+		tmaxDef->is_local = true;
+		tmaxDef->is_not_null = false;
+		tmaxDef->is_from_type = false;
+		tmaxDef->storage = 0;
+		tmaxDef->raw_default = NULL;
+		tmaxDef->cooked_default = NULL;
+		tmaxDef->identity = 0;
+		tmaxDef->identitySequence = NULL;
+		tmaxDef->generated = 0;
+		tmaxDef->collClause = NULL;
+		tmaxDef->collOid = InvalidOid;
+		tmaxDef->constraints = NIL;
+		tmaxDef->fdwoptions = NIL;
+		tmaxDef->location = -1;
+	}
+	
+	tableElts = lappend(tableElts, tminDef);
+	tableElts = lappend(tableElts, tmaxDef);
+
+	/* 
+     * inherit attributes from current table
+	 * stall pass constraints, but shouldn't add constraint to this var
+	 * so constraints should remain NIL
+	 */
+	tableElts = 
+		MergeAttributesForArchive(tableElts, inheritOids,
+								  RELPERSISTENCE_PERMANENT,
+								  false);
+	/* never inherit any constraints from current tables */
+	Assert(constraints == NIL);
+	/*
+	 * Create a tuple descriptor from the relation schema.  Note that this
+	 * deals with column names, types, and NOT NULL constraints, but not
+	 * default values or CHECK constraints; we handle those below.
+	 */
+	descriptor = BuildDescForRelation(tableElts); 
+	cookedDefaults = NIL;
+	/*
+	 * If the statement hasn't specified an access method, but we're defining
+	 * a type of relation that needs one, use the default.
+	 */
+	accessMethod = default_table_access_method;
+	/* look up the access method, verify it is for a table */
+	if (accessMethod != NULL)
+		accessMethodId = get_table_am_oid(accessMethod, false);
+	/*
+	 * Create the relation.  Inherited defaults and constraints are passed in
+	 * for immediate handling --- since they don't need parsing, they can be
+	 * stored immediately.
+	 */
+	relationId = heap_create_with_catalog(relname,
+										  namespaceId,
+										  tablespaceId,
+										  InvalidOid,
+										  InvalidOid,
+										  ofTypeId,
+										  ownerId,
+										  accessMethodId,
+										  descriptor,
+										  list_concat(cookedDefaults,
+													  constraints),
+										  RELKIND_RELATION,
+										  RELPERSISTENCE_PERMANENT,
+										  false,
+										  false,
+										  ONCOMMIT_NOOP,
+										  reloptions,
+										  true,
+										  allowSystemTableMods,
+										  false,
+										  InvalidOid,
+										  NULL,
+										  true, /* isarchive */
+										  false /* istminmap */
+										  );
+
+	/* receive new history table address */
+	ObjectAddressSet(address, RelationRelationId, relationId);
+	/* set null toast options for history table */
+	toast_options = (Datum) 0;
+	(void) heap_reloptions(RELKIND_TOASTVALUE,
+						   toast_options,
+						   true);
+	/* create toast table for history table */
+	NewRelationCreateToastTable(address.objectId,
+								toast_options);
+
+	return relationId;
+}
+
+Oid
+DefineTminMapRelation(Relation rel)
+{
+	/* enable flashback means we need to create tminmap table for this relation */
+	ObjectAddress address;
+	char		relname[NAMEDATALEN];
+	char		idxname[NAMEDATALEN];
+	Oid			namespaceId = InvalidOid;
+	Oid 		tablespaceId = InvalidOid;
+	Oid         ownerId = InvalidOid;
+	Datum       reloptions = (Datum) 0;
+	Datum		toast_options = (Datum) 0;
+	Oid         ofTypeId = InvalidOid;
+	List       *tableElts = NIL;
+	List	   *constraints = NIL;
+	TupleDesc	descriptor = NULL;
+	List	   *cookedDefaults = NIL;
+	const char *accessMethod = NULL;
+	Oid			accessMethodId = InvalidOid;
+	Oid			relationId = InvalidOid;
+	ColumnDef  *cposDef = NULL;
+	ColumnDef  *tminDef = NULL;
+	IndexInfo  *indexInfo = NULL;
+	Oid			collationObjectId[1];
+	Oid			classObjectId[1];
+	int16		coloptions[1];
+	Relation    tminmap_rel;
+	/* if already enabled, no need to enable again */
+	if (rel->rd_rel->reltminmaprelid != InvalidOid) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WARNING),
+				 errmsg("already enable flashback")));
+	}
+	/* cannot enable flashback for one history table */
+	if (rel->rd_rel->relisarchive) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot enable flashback for one history table")));
+	}
+	/* cannot enable flashback for one tminmap table */
+	if (rel->rd_rel->relistminmap) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot enable flashback for one tminmap table")));
+	}
+
+	/*
+	 * Create the tminmap table name
+	 */
+	snprintf(relname, sizeof(relname), "pg_tminmap_%u", rel->rd_id);
+
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("temp table can not enable flashback")));
+	}
+	if (rel->rd_rel->relkind != RELKIND_RELATION) 
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("only partitions and normal tables can enable flashback")));
+	}
+	/* current table and tminmap table should be in the same namespace */
+	namespaceId = RelationGetNamespace(rel);
+	/* tminmap table's tablespaceId should be the same with current table */
+	tablespaceId = get_rel_tablespace(RelationGetRelid(rel));
+	/* Check permissions except when using database's default */
+	if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
+	{
+		AclResult	aclresult;
+		aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(),
+										   ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_TABLESPACE,
+						   get_tablespace_name(tablespaceId));
+	}
+	/* 
+	 * In all cases disallow placing user relations in pg_global 
+	 * actually current table cannot be in pg_global, so tminmap table shouldn't be in pg_global 
+	 */
+	if (tablespaceId == GLOBALTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("only shared relations can be placed in pg_global tablespace")));
+	/* Identify user ID that will own the relation */
+	ownerId = GetUserId();
+	/* Permissions checks */
+	if (!pg_class_ownercheck(RelationGetRelid(rel), ownerId))
+		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
+					   RelationGetRelationName(rel));
+	/*
+	 * Parse and validate reloptions, if any. we can set empty here because alter dont pass any options
+	 */
+	reloptions = (Datum) 0;
+	(void) heap_reloptions(RELKIND_RELATION, reloptions, true); 
+	/* 
+	 * copy current table oftype to tminmap table
+	 * if dont permit InvalidOid ofTypeId, it will occur error when creating current table
+	 * so we dont need to check ofTypeId 
+	 */
+	ofTypeId = rel->rd_rel->reloftype;
+
+	/* add cpos column */	
+	{
+		cposDef = makeNode(ColumnDef);
+		cposDef->type = T_ColumnDef;
+		cposDef->colname = pstrdup("pg_cpos");
+		cposDef->typeName = SystemTypeName("tid");
+		cposDef->inhcount = 0;
+		cposDef->is_local = true;
+		cposDef->is_not_null = false;
+		cposDef->is_from_type = false;
+		cposDef->storage = 0;
+		cposDef->raw_default = NULL;
+		cposDef->cooked_default = NULL;
+		cposDef->identity = 0;
+		cposDef->identitySequence = NULL;
+		cposDef->generated = 0;
+		cposDef->collClause = NULL;
+		cposDef->collOid = InvalidOid;
+		cposDef->constraints = NIL;
+		cposDef->fdwoptions = NIL;
+		cposDef->location = -1;
+	}
+	/* add tmin column */
+	{
+		tminDef = makeNode(ColumnDef);
+		tminDef->type = T_ColumnDef;
+		tminDef->colname = pstrdup("pg_tmin");
+		tminDef->typeName = SystemTypeName("timestamptz");
+		tminDef->inhcount = 0;
+		tminDef->is_local = true;
+		tminDef->is_not_null = false;
+		tminDef->is_from_type = false;
+		tminDef->storage = 0;
+		tminDef->raw_default = NULL;
+		tminDef->cooked_default = NULL;
+		tminDef->identity = 0;
+		tminDef->identitySequence = NULL;
+		tminDef->generated = 0;
+		tminDef->collClause = NULL;
+		tminDef->collOid = InvalidOid;
+		tminDef->constraints = NIL;
+		tminDef->fdwoptions = NIL;
+		tminDef->location = -1;
+	}
+	
+	tableElts = lappend(tableElts, cposDef);
+	tableElts = lappend(tableElts, tminDef);
+
+	/* tminmap will create unique index on pg_cpos later */
+	Assert(constraints == NIL);
+	/*
+	 * Create a tuple descriptor from the relation schema.  Note that this
+	 * deals with column names, types, and NOT NULL constraints, but not
+	 * default values or CHECK constraints; we handle those below.
+	 */
+	descriptor = BuildDescForRelation(tableElts); 
+	cookedDefaults = NIL;
+	/*
+	 * If the statement hasn't specified an access method, but we're defining
+	 * a type of relation that needs one, use the default.
+	 */
+	accessMethod = default_table_access_method;
+	/* look up the access method, verify it is for a table */
+	if (accessMethod != NULL)
+		accessMethodId = get_table_am_oid(accessMethod, false);
+	/*
+	 * Create the relation.  Inherited defaults and constraints are passed in
+	 * for immediate handling --- since they don't need parsing, they can be
+	 * stored immediately.
+	 */
+	relationId = heap_create_with_catalog(relname,
+										  namespaceId,
+										  tablespaceId,
+										  InvalidOid,
+										  InvalidOid,
+										  ofTypeId,
+										  ownerId,
+										  accessMethodId,
+										  descriptor,
+										  list_concat(cookedDefaults,
+													  constraints),
+										  RELKIND_RELATION,
+										  RELPERSISTENCE_PERMANENT,
+										  false,
+										  false,
+										  ONCOMMIT_NOOP,
+										  reloptions,
+										  true,
+										  allowSystemTableMods,
+										  false,
+										  InvalidOid,
+										  NULL,
+										  false, /* isarchive */
+										  true   /* istminmap */
+										  );
+
+	/* receive new tminmap table address */
+	ObjectAddressSet(address, RelationRelationId, relationId);
+	/* set null toast options for tminmap table */
+	toast_options = (Datum) 0;
+	(void) heap_reloptions(RELKIND_TOASTVALUE,
+						   toast_options,
+						   true);
+	/* create toast table for tminmap table, may do nothing */
+	NewRelationCreateToastTable(address.objectId,
+								toast_options);
+
+	/* create tminmap index name */
+	snprintf(idxname, sizeof(idxname), "pg_tminmap_%u_index", rel->rd_id);
+
+	/* ShareLock is not really needed here, but take it anyway */
+	tminmap_rel = table_open(relationId, ShareLock);
+
+	/* 
+	 * create index on pg_cpos
+	 */
+	indexInfo = makeNode(IndexInfo);
+	indexInfo->ii_NumIndexAttrs = 1;
+	indexInfo->ii_NumIndexKeyAttrs = 1;
+	indexInfo->ii_IndexAttrNumbers[0] = 1;
+	indexInfo->ii_Expressions = NIL;
+	indexInfo->ii_ExpressionsState = NIL;
+	indexInfo->ii_Predicate = NIL;
+	indexInfo->ii_PredicateState = NULL;
+	indexInfo->ii_ExclusionOps = NULL;
+	indexInfo->ii_ExclusionProcs = NULL;
+	indexInfo->ii_ExclusionStrats = NULL;
+	indexInfo->ii_OpclassOptions = NULL;
+	indexInfo->ii_Unique = false;
+	indexInfo->ii_ReadyForInserts = true;
+	indexInfo->ii_Concurrent = false;
+	indexInfo->ii_BrokenHotChain = false;
+	indexInfo->ii_ParallelWorkers = 0;
+#ifndef TMINMAP_BTREE_INDEX
+	indexInfo->ii_Am = HASH_AM_OID;
+#else
+	indexInfo->ii_Am = BTREE_AM_OID;
+#endif
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
+
+	collationObjectId[0] = InvalidOid;
+
+#ifndef TMINMAP_BTREE_INDEX
+	/* 
+	 * HASH_OPS_OID for TID
+	 */
+	classObjectId[0] = 10054;
+
+	coloptions[0] = 0;
+
+	index_create(tminmap_rel, idxname, InvalidOid, InvalidOid,
+				 InvalidOid, InvalidOid,
+				 indexInfo,
+				 list_make1("pg_cpos"),
+				 HASH_AM_OID,
+				 tablespaceId,
+				 collationObjectId, classObjectId, coloptions, (Datum) 0,
+				 INDEX_CREATE_IF_NOT_EXISTS, 0, allowSystemTableMods, false, NULL);
+#else
+	/* 
+	 * BTREE_OPS_OID for TID
+	 */
+	classObjectId[0] = 10049;
+
+	coloptions[0] = 0;
+
+	index_create(tminmap_rel, idxname, InvalidOid, InvalidOid,
+				 InvalidOid, InvalidOid,
+				 indexInfo,
+				 list_make1("pg_cpos"),
+				 BTREE_AM_OID,
+				 tablespaceId,
+				 collationObjectId, classObjectId, coloptions, (Datum) 0,
+				 INDEX_CREATE_IF_NOT_EXISTS, 0, allowSystemTableMods, false, NULL);
+#endif
+
+	table_close(tminmap_rel, ShareLock);
+
+	return relationId;
+}
+
+void
+ATExecEnableFlashback(Relation rel)
+{
+	Relation	pg_class;
+	Oid			relid;
+	HeapTuple	tuple;
+	Oid 		archiveOid;
+	Oid 		tminmapOid;
+
+	archiveOid = DefineArchiveRelation(rel);
+	tminmapOid = DefineTminMapRelation(rel);
+
+	/* search pg_class tuple in syscache */
+	relid = RelationGetRelid(rel);
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	/* 
+	 * update information and write to disk 
+	 * if only modify rel, information will be lost after db restart
+	 */
+	/* this error should not occur */
+	Assert(OidIsValid(archiveOid) && OidIsValid(tminmapOid));
+
+	((Form_pg_class) GETSTRUCT(tuple))->relarchiverelid = archiveOid;
+	((Form_pg_class) GETSTRUCT(tuple))->reltminmaprelid = tminmapOid;
+
+	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+
+	/* close pg_class and clean up */
+	table_close(pg_class, RowExclusiveLock);
+	heap_freetuple(tuple);
+}
+
+Oid
+DeleteArchiveRelation(Relation rel)
+{
+	ObjectAddresses *objects;
+	int			    flags = 0;
+	Oid			    relOid;
+	ObjectAddress   obj;
+
+	/* Lock and validate each relation; build a list of object addresses */
+	objects = new_object_addresses();
+	{
+		/*
+		 * These next few steps are a great deal like relation_openrv, but we
+		 * don't bother building a relcache entry since we don't need it.
+		 *
+		 * Check for shared-cache-inval messages before trying to access the
+		 * relation.  This is needed to cover the case where the name
+		 * identifies a rel that has been dropped and recreated since the
+		 * start of our transaction: if we don't flush the old syscache entry,
+		 * then we'll latch onto that entry and suffer an error later.
+		 */
+		AcceptInvalidationMessages();
+		relOid = rel->rd_rel->relarchiverelid;
+		if (!OidIsValid(relOid)) 
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_WARNING),
+					 errmsg("already disable flashback")));
+		} 
+		else if (rel->rd_rel->relisarchive) 
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot disable flashback for history tables")));
+		} 
+		else if (rel->rd_rel->relistminmap)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot disable flashback for tminmap tables")));
+		}
+		else
+		{
+			/* OK, we're ready to delete this one */
+			obj.classId = RelationRelationId;
+			obj.objectId = relOid; 
+			obj.objectSubId = 0;
+			add_exact_object_address(&obj, objects);
+		}
+	}
+	performMultipleDeletions(objects, DROP_CASCADE, flags);
+	free_object_addresses(objects);
+
+	return relOid;
+}
+
+Oid
+DeleteTminMapRelation(Relation rel)
+{
+	ObjectAddresses *objects;
+	int			    flags = 0;
+	Oid			    relOid;
+	ObjectAddress   obj;
+
+	/* Lock and validate each relation; build a list of object addresses */
+	objects = new_object_addresses();
+	{
+		/*
+		 * These next few steps are a great deal like relation_openrv, but we
+		 * don't bother building a relcache entry since we don't need it.
+		 *
+		 * Check for shared-cache-inval messages before trying to access the
+		 * relation.  This is needed to cover the case where the name
+		 * identifies a rel that has been dropped and recreated since the
+		 * start of our transaction: if we don't flush the old syscache entry,
+		 * then we'll latch onto that entry and suffer an error later.
+		 */
+		AcceptInvalidationMessages();
+		relOid = rel->rd_rel->reltminmaprelid;
+		if (!OidIsValid(relOid)) 
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_WARNING),
+					 errmsg("already disable flashback")));
+		} 
+		else if (rel->rd_rel->relisarchive) 
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot disable flashback for history tables")));
+		} 
+		else if (rel->rd_rel->relistminmap)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot disable flashback for tminmap tables")));
+		}
+		else
+		{
+			/* OK, we're ready to delete this one */
+			obj.classId = RelationRelationId;
+			obj.objectId = relOid; 
+			obj.objectSubId = 0;
+			add_exact_object_address(&obj, objects);
+		}
+	}
+	performMultipleDeletions(objects, DROP_CASCADE, flags);
+	free_object_addresses(objects);
+
+	return relOid;
+}
+
+void
+ATExecDisableFlashback(Relation rel)
+{
+	Relation	pg_class;
+	Oid			relid;
+	HeapTuple	tuple;
+	Oid 		archiveOid;
+	Oid 		tminmapOid;
+	
+	archiveOid = DeleteArchiveRelation(rel);
+	tminmapOid = DeleteTminMapRelation(rel);
+
+	/* search pg_class tuple in syscache */
+	relid = RelationGetRelid(rel);
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	/* 
+	 * update information and write to disk 
+	 * if only modify rel, information will be lost after db restart
+	 */
+	/* this error should not occur */
+	if (!OidIsValid(archiveOid) || !OidIsValid(tminmapOid))
+	{
+		elog(ERROR, "archive table oid or tminmap table oid already lost");
+	}
+
+	((Form_pg_class) GETSTRUCT(tuple))->relarchiverelid = InvalidOid;
+	((Form_pg_class) GETSTRUCT(tuple))->reltminmaprelid = InvalidOid;
+
+	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+
+	/* close pg_class and clean up */
+	table_close(pg_class, RowExclusiveLock);
+	heap_freetuple(tuple);
+}
+
 /*
  * ALTER TABLE FORCE/NO FORCE ROW LEVEL SECURITY
  */
@@ -18082,425 +18968,4 @@ ATDetachCheckNoForeignKeyRefs(Relation partition)
 
 		table_close(rel, NoLock);
 	}
-}
-
-void ATExecEnableDeleteBackup(Relation rel)
-{
-	Oid backupTableOid;
-	HeapTuple tuple;
-	HeapTuple classTup;
-	Relation	pg_class;
-	Oid			relid;
-
-	backupTableOid = DefineArchiveRelation(rel);
-
-	relid = RelationGetRelid(rel);
-
-	pg_class = table_open(RelationRelationId, RowExclusiveLock);
-
-	/* 修改 pg_class，设置 relbackup 字段 */
-	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
-	if (!HeapTupleIsValid(classTup))
-		elog(ERROR, "cache lookup failed for relation %u", relid);
-
-	((Form_pg_class)GETSTRUCT(classTup))->relbackup = backupTableOid;
-
-	Assert(OidIsValid(backupTableOid));
-
-	/* 更新 pg_class */
-	CatalogTupleUpdate(pg_class, &classTup->t_self, classTup);
-
-	/* 释放内存 */
-	table_close(pg_class, RowExclusiveLock);
-	heap_freetuple(tuple);
-}
-
-static void ATExecDisableDeleteBackup(Relation rel){
-	// Oid backupTableOid;
-	// HeapTuple classTup;
-
-	// /* 检查是否启用了 DELETEBACKUP */
-	// backupTableOid = RelationGetRelbackup(rel);
-	// if (backupTableOid == InvalidOid)
-	// 	ereport(ERROR,
-	// 			(errmsg("DELETEBACKUP is not enabled on table \"%s\"",
-	// 					RelationGetRelationName(rel))));
-
-	// /* 删除备份表 */
-	// ObjectAddress backupTableAddr = {RelationRelationId, backupTableOid};
-	// performDeletion(&backupTableAddr, DROP_CASCADE, 0);
-
-	// /* 修改 pg_class 清空 relbackup 字段 */
-	// classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
-	// if (!HeapTupleIsValid(classTup))
-	// 	elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(rel));
-
-	// ((Form_pg_class)GETSTRUCT(classTup))->relbackup = InvalidOid;
-
-	// /* 更新 pg_class */
-	// CatalogTupleUpdate(RelationGetRelid(rel), &classTup->t_self, classTup);
-
-	// /* 释放内存 */
-	// heap_freetuple(classTup);
-}
-Oid DefineArchiveRelation(Relation rel)
-{
-	/* enable flashback means we need to create history table for this relation */
-	ObjectAddress address;
-	char		relname[NAMEDATALEN];
-	char *backupTableName;
-
-	Oid			namespaceId = InvalidOid;
-	List	   *inheritOids = NIL;
-	Oid 		tablespaceId = InvalidOid;
-	Oid         ownerId = InvalidOid;
-	Datum       reloptions = (Datum) 0;
-	Datum		toast_options = (Datum) 0;
-	Oid         ofTypeId = InvalidOid;
-	List       *tableElts = NIL;
-	List	   *constraints = NIL;
-	TupleDesc	descriptor = NULL;
-	List	   *cookedDefaults = NIL;
-	const char *accessMethod = NULL;
-	Oid			accessMethodId = InvalidOid;
-	Oid			relationId = InvalidOid;
-	ColumnDef  *pgdeltsDef = NULL;
-	List       *options = NIL;
-	DefElem    *option = NULL;
-	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
-
-	/* if already enabled, no need to enable again */
-	if (rel->rd_rel->relbackup != InvalidOid) 
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_WARNING),
-				 errmsg("already enable flashback")));
-	}
-	/* 生成备份表名 */
-	backupTableName = psprintf("%s_backup", RelationGetRelationName(rel));
-	/* current table and history table should be in the same namespace */
-	namespaceId = RelationGetNamespace(rel);
-	/* add current table oid to parent id, so we can inherit its attrs to history table*/
-	inheritOids = lappend_oid(inheritOids, RelationGetRelid(rel));
-	/* history table's tablespaceId should be the same with current table */
-	Assert(list_length(inheritOids) == 1);
-	tablespaceId = get_rel_tablespace(linitial_oid(inheritOids));
-	/* Check permissions except when using database's default */
-	if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
-	{
-		AclResult	aclresult;
-		aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(),
-										   ACL_CREATE);
-		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, OBJECT_TABLESPACE,
-						   get_tablespace_name(tablespaceId));
-	}
-	/* 
-	 * In all cases disallow placing user relations in pg_global 
-	 * actually current table cannot be in pg_global, so history table shouldn't be in pg_global 
-	 */
-	if (tablespaceId == GLOBALTABLESPACE_OID)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("only shared relations can be placed in pg_global tablespace")));
-	/* Identify user ID that will own the relation */
-	ownerId = GetUserId();
-		ownerId = GetUserId();
-	/* Permissions checks */
-	if (!pg_class_ownercheck(RelationGetRelid(rel), ownerId))
-		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
-					   RelationGetRelationName(rel));
-	/*
-	 * Parse and validate reloptions, if any. we can set empty here because alter dont pass any options
-	 */
-	{
-		Value *arg = makeNode(Value);
-		arg->type = T_String;
-		(arg->val).str = "false";
-
-		option = makeNode(DefElem);
-		option->type = T_DefElem;
-		option->defnamespace = NULL;
-		option->defname = "autovacuum_enabled";
-		option->defaction = DEFELEM_UNSPEC;
-		option->location = -1;
-		option->arg = (Node *)arg;
-	}
-	options = lappend(options, option);
-	reloptions = transformRelOptions((Datum) 0, options, NULL, validnsps,
-									 true, false);
-	(void) heap_reloptions(RELKIND_RELATION, reloptions, true); 
-	/* 
-	 * copy current table oftype to history table
-	 * if dont permit InvalidOid ofTypeId, it will occur error when creating current table
-	 * so we dont need to check ofTypeId 
-	 */
-	ofTypeId = rel->rd_rel->reloftype;
-	/* add pg_del_ts column */	
-	{
-		pgdeltsDef = makeNode(ColumnDef);
-		pgdeltsDef->type = T_ColumnDef;
-		pgdeltsDef->colname = pstrdup("pg_del_ts");
-		pgdeltsDef->typeName = SystemTypeName("timestamptz");
-		pgdeltsDef->inhcount = 0;
-		pgdeltsDef->is_local = true;
-		pgdeltsDef->is_not_null = false;
-		pgdeltsDef->is_from_type = false;
-		pgdeltsDef->storage = 0;
-		pgdeltsDef->raw_default = NULL;
-		pgdeltsDef->cooked_default = NULL;
-		pgdeltsDef->identity = 0;
-		pgdeltsDef->identitySequence = NULL;
-		pgdeltsDef->generated = 0;
-		pgdeltsDef->collClause = NULL;
-		pgdeltsDef->collOid = InvalidOid;
-		pgdeltsDef->constraints = NIL;
-		pgdeltsDef->fdwoptions = NIL;
-		pgdeltsDef->location = -1;
-	}
-	tableElts = lappend(tableElts, pgdeltsDef);
-	/* 
-     * inherit attributes from current table
-	 * stall pass constraints, but shouldn't add constraint to this var
-	 * so constraints should remain NIL
-	 */
-	tableElts = 
-		MergeAttributesForArchive(tableElts, inheritOids,
-								  RELPERSISTENCE_PERMANENT,
-								  false);
-	/* never inherit any constraints from current tables */
-	Assert(constraints == NIL);
-		/*
-	 * Create a tuple descriptor from the relation schema.  Note that this
-	 * deals with column names, types, and NOT NULL constraints, but not
-	 * default values or CHECK constraints; we handle those below.
-	 */
-	descriptor = BuildDescForRelation(tableElts); 
-	cookedDefaults = NIL;
-	/*
-	 * If the statement hasn't specified an access method, but we're defining
-	 * a type of relation that needs one, use the default.
-	 */
-	accessMethod = default_table_access_method;
-	/* look up the access method, verify it is for a table */
-	if (accessMethod != NULL)
-		accessMethodId = get_table_am_oid(accessMethod, false);
-	/*
-	 * Create the relation.  Inherited defaults and constraints are passed in
-	 * for immediate handling --- since they don't need parsing, they can be
-	 * stored immediately.
-	 */
-	relationId = heap_create_with_catalog(relname,
-										  namespaceId,
-										  tablespaceId,
-										  InvalidOid,
-										  InvalidOid,
-										  ofTypeId,
-										  ownerId,
-										  accessMethodId,
-										  descriptor,
-										  list_concat(cookedDefaults,
-													  constraints),
-										  RELKIND_RELATION,
-										  RELPERSISTENCE_PERMANENT,
-										  false,
-										  false,
-										  ONCOMMIT_NOOP,
-										  reloptions,
-										  true,
-										  allowSystemTableMods,
-										  false,
-										  InvalidOid,
-										  NULL
-										  );
-										  	/* receive new history table address */
-	ObjectAddressSet(address, RelationRelationId, relationId);
-	/* set null toast options for history table */
-	toast_options = (Datum) 0;
-	(void) heap_reloptions(RELKIND_TOASTVALUE,
-						   toast_options,
-						   true);
-	/* create toast table for history table */
-	NewRelationCreateToastTable(address.objectId,
-								toast_options);
-
-	return relationId;
-}
-
-static List *
-MergeAttributesForArchive(List *schema, List *supers, char relpersistence,
-						  bool is_partition)
-{
-	List	   *inhSchema = NIL;
-	int			child_attno;
-	ListCell   *entry;
-	/*
-	 * Check for and reject tables with too many columns. We perform this
-	 * check relatively early for two reasons: (a) we don't run the risk of
-	 * overflowing an AttrNumber in subsequent code (b) an O(n^2) algorithm is
-	 * okay if we're processing <= 1600 columns, but could take minutes to
-	 * execute if the user attempts to create a table with hundreds of
-	 * thousands of columns.
-	 *
-	 * Note that we also need to check that we do not exceed this figure after
-	 * including columns from inherited relations.
-	 * 
-	 * it also check when creating current table
-	 * 
-	 * considering pg_tmin, pg_tmax columns, we can only have at most MaxHeapAttributeNumber - 2 columns
-	 */
-	if (list_length(schema) > MaxHeapAttributeNumber - 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_TOO_MANY_COLUMNS),
-				 errmsg("if you want to enable flashback, tables can have at most %d columns",
-						MaxHeapAttributeNumber - 1)));
-	/*
-	 * Scan the parents left-to-right, and merge their attributes to form a
-	 * list of inherited attributes (inhSchema).  Also check to see if we need
-	 * to inherit an OID column.
-	 */
-	child_attno = 0;
-	foreach(entry, supers)
-	{
-		Oid			parent = lfirst_oid(entry);
-		Relation	relation;
-		TupleDesc	tupleDesc;
-		AttrMap    *newattmap;
-		AttrNumber	parent_attno;
-		/* caller already got lock */
-		relation = table_open(parent, NoLock);
-		/*
-		 * We do not allow partitioned tables to participate in
-		 * regular inheritance.
-		 * 
-		 * currently support partitions and normal table to enable flashback
-		 */
-		if (relation->rd_rel->relkind != RELKIND_RELATION)
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("currently, only allow normal tables and partitions to enable flashback")));
-		/* 
-		 * Permanent rels cannot inherit from temporary ones
-		 *
-		 * currently, dont care about this check
-		 */
-		if (relpersistence != RELPERSISTENCE_TEMP &&
-			relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg(!is_partition
-							? "cannot inherit from temporary relation \"%s\""
-							: "cannot create a permanent relation as partition of temporary relation \"%s\"",
-							RelationGetRelationName(relation))));
-		/*
-		 * We should have an UNDER permission flag for this, but for now,
-		 * demand that creator of a child table own the parent.
-		 */
-		if (!pg_class_ownercheck(RelationGetRelid(relation), GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(relation->rd_rel->relkind),
-						   RelationGetRelationName(relation));
-		tupleDesc = RelationGetDescr(relation);
-		/*
-		 * newattmap->attnums[] will contain the child-table attribute numbers
-		 * for the attributes of this parent table.  (They are not the same
-		 * for parents after the first one, nor if we have dropped columns.)
-		 */
-		newattmap = make_attrmap(tupleDesc->natts);
-
-		for (parent_attno = 1; parent_attno <= tupleDesc->natts;
-			 parent_attno++)
-		{
-			Form_pg_attribute attribute = TupleDescAttr(tupleDesc,
-														parent_attno - 1);
-			char	   *attributeName = NameStr(attribute->attname);
-			ColumnDef  *def;
-			/*
-			 * Ignore dropped columns in the parent.
-			 */
-			if (attribute->attisdropped)
-				continue;		/* leave newattmap->attnums entry as zero */
-			/*
-			 *create a new inherited column
-			 */
-			{
-				def = makeNode(ColumnDef);
-				def->colname = pstrdup(attributeName);
-				def->typeName = makeTypeNameFromOid(attribute->atttypid,
-													attribute->atttypmod);
-				def->inhcount = 0;
-				def->is_local = true;
-				def->is_not_null = false;
-				def->is_from_type = false;
-				def->storage = 0;
-				def->raw_default = NULL;
-				def->cooked_default = NULL;
-				def->generated = 0;
-				def->collClause = NULL;
-				def->collOid = InvalidOid;
-				def->constraints = NIL;
-				def->location = -1;
-				inhSchema = lappend(inhSchema, def);
-				newattmap->attnums[parent_attno - 1] = ++child_attno;
-			}
-		}
-		/*
-		 * Now copy the CHECK constraints of this parent, adjusting attnos
-		 * using the completed newattmap map.  Identically named constraints
-		 * are merged if possible, else we throw error.
-		 * 
-		 * we dont copy any constraints from current table.
-		 */
-		free_attrmap(newattmap);
-		/*
-		 * Close the parent rel, but keep our lock on it until xact commit.
-		 * That will prevent someone else from deleting or ALTERing the parent
-		 * before the child is committed.
-		 */
-		table_close(relation, NoLock);
-	}
-	/*
-	 * If we had no inherited attributes, the result schema is just the
-	 * explicitly declared columns.  Otherwise, we need to merge the declared
-	 * columns into the inherited schema list.  
-	 */
-	if (inhSchema != NIL)
-	{
-		int			schema_attno = 0;
-		/* should ignore this loop */
-		foreach(entry, schema)
-		{
-			ColumnDef  *newdef = lfirst(entry);
-			char	   *attributeName = newdef->colname;
-			int			exist_attno;
-			schema_attno++;
-			/*
-			 * Does it conflict with some previously inherited column?
-			 */
-			exist_attno = findAttrByName(attributeName, inhSchema);
-			if (exist_attno > 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERNAL_ERROR),
-					 	 errmsg("table columns should not contain pg_tmin, pg_tmax")));
-			{
-				/*
-				 * assume that added columns (pg_tmin and pg_tmax) never conflict with current table
-				 */
-				inhSchema = lappend(inhSchema, newdef);
-			}
-		}
-		/* directly copy inhSchema */
-		schema = inhSchema;
-		/*
-		 * Check that we haven't exceeded the legal # of columns after merging
-		 * in inherited columns.
-		 */
-		if (list_length(schema) > MaxHeapAttributeNumber)
-			ereport(ERROR,
-					(errcode(ERRCODE_TOO_MANY_COLUMNS),
-					 errmsg("tables can have at most %d columns",
-							MaxHeapAttributeNumber)));
-	}
-	/* no need to overwrite constraints */
-	// *supconstr = constraints;
-	return schema;
 }

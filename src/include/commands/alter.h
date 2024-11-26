@@ -32,7 +32,4 @@ extern ObjectAddress ExecAlterOwnerStmt(AlterOwnerStmt *stmt);
 extern void AlterObjectOwner_internal(Relation catalog, Oid objectId,
 									  Oid new_ownerId);
 
-extern void ATExecEnableDeleteBackup(Relation rel);
-extern void ATExecDisableDeleteBackup(Relation rel);
-
 #endif /* ALTER_H */

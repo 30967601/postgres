@@ -6527,12 +6527,3 @@ unlink_initfile(const char *initfilename, int elevel)
 							initfilename)));
 	}
 }
-Oid
-RelationGetRelbackup(Relation rel)
-{
-    /* 确保 Relation 的元数据存在 */
-    Assert(rel->rd_rel != NULL);
-
-    /* 返回 relbackup 字段 */
-    return rel->rd_rel->relbackup;
-}
