@@ -18090,9 +18090,17 @@ void ATExecEnableDeleteBackup(Relation rel)
 	HeapTuple tuple;
 	HeapTuple classTup;
 	Relation	pg_class;
+	Relation	backup_open;
 	Oid			relid;
 
 	backupTableOid = DefineArchiveRelation(rel);
+	
+	rel->rd_rel->relbackup = backupTableOid;
+
+	backup_open = table_open(backupTableOid, AccessExclusiveLock);
+
+	// table_close(backup_open, AccessExclusiveLock);
+	// backup_open = table_open(backupTableOid,RowExclusiveLock);
 
 	relid = RelationGetRelid(rel);
 
@@ -18143,13 +18151,12 @@ static void ATExecDisableDeleteBackup(Relation rel){
 	// /* 释放内存 */
 	// heap_freetuple(classTup);
 }
-Oid DefineArchiveRelation(Relation rel)
+Oid
+DefineArchiveRelation(Relation rel)
 {
 	/* enable flashback means we need to create history table for this relation */
 	ObjectAddress address;
 	char		relname[NAMEDATALEN];
-	char *backupTableName;
-
 	Oid			namespaceId = InvalidOid;
 	List	   *inheritOids = NIL;
 	Oid 		tablespaceId = InvalidOid;
@@ -18164,7 +18171,7 @@ Oid DefineArchiveRelation(Relation rel)
 	const char *accessMethod = NULL;
 	Oid			accessMethodId = InvalidOid;
 	Oid			relationId = InvalidOid;
-	ColumnDef  *pgdeltsDef = NULL;
+	ColumnDef  *delDef = NULL;
 	List       *options = NIL;
 	DefElem    *option = NULL;
 	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
@@ -18176,8 +18183,11 @@ Oid DefineArchiveRelation(Relation rel)
 				(errcode(ERRCODE_WARNING),
 				 errmsg("already enable flashback")));
 	}
-	/* 生成备份表名 */
-	backupTableName = psprintf("%s_backup", RelationGetRelationName(rel));
+	/*
+	 * Create the history table name
+	 */
+	snprintf(relname, sizeof(relname), "pg_backup_%u", rel->rd_id);
+
 	/* current table and history table should be in the same namespace */
 	namespaceId = RelationGetNamespace(rel);
 	/* add current table oid to parent id, so we can inherit its attrs to history table*/
@@ -18205,7 +18215,6 @@ Oid DefineArchiveRelation(Relation rel)
 				 errmsg("only shared relations can be placed in pg_global tablespace")));
 	/* Identify user ID that will own the relation */
 	ownerId = GetUserId();
-		ownerId = GetUserId();
 	/* Permissions checks */
 	if (!pg_class_ownercheck(RelationGetRelid(rel), ownerId))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
@@ -18236,29 +18245,32 @@ Oid DefineArchiveRelation(Relation rel)
 	 * so we dont need to check ofTypeId 
 	 */
 	ofTypeId = rel->rd_rel->reloftype;
-	/* add pg_del_ts column */	
+
+	/* add tmin column */	
 	{
-		pgdeltsDef = makeNode(ColumnDef);
-		pgdeltsDef->type = T_ColumnDef;
-		pgdeltsDef->colname = pstrdup("pg_del_ts");
-		pgdeltsDef->typeName = SystemTypeName("timestamptz");
-		pgdeltsDef->inhcount = 0;
-		pgdeltsDef->is_local = true;
-		pgdeltsDef->is_not_null = false;
-		pgdeltsDef->is_from_type = false;
-		pgdeltsDef->storage = 0;
-		pgdeltsDef->raw_default = NULL;
-		pgdeltsDef->cooked_default = NULL;
-		pgdeltsDef->identity = 0;
-		pgdeltsDef->identitySequence = NULL;
-		pgdeltsDef->generated = 0;
-		pgdeltsDef->collClause = NULL;
-		pgdeltsDef->collOid = InvalidOid;
-		pgdeltsDef->constraints = NIL;
-		pgdeltsDef->fdwoptions = NIL;
-		pgdeltsDef->location = -1;
+		delDef = makeNode(ColumnDef);
+		delDef->type = T_ColumnDef;
+		delDef->colname = pstrdup("pg_del_ts");
+		delDef->typeName = SystemTypeName("timestamptz");
+		delDef->inhcount = 0;
+		delDef->is_local = true;
+		delDef->is_not_null = false;
+		delDef->is_from_type = false;
+		delDef->storage = 0;
+		delDef->raw_default = NULL;
+		delDef->cooked_default = NULL;
+		delDef->identity = 0;
+		delDef->identitySequence = NULL;
+		delDef->generated = 0;
+		delDef->collClause = NULL;
+		delDef->collOid = InvalidOid;
+		delDef->constraints = NIL;
+		delDef->fdwoptions = NIL;
+		delDef->location = -1;
 	}
-	tableElts = lappend(tableElts, pgdeltsDef);
+	
+	tableElts = lappend(tableElts, delDef);
+
 	/* 
      * inherit attributes from current table
 	 * stall pass constraints, but shouldn't add constraint to this var
@@ -18270,7 +18282,7 @@ Oid DefineArchiveRelation(Relation rel)
 								  false);
 	/* never inherit any constraints from current tables */
 	Assert(constraints == NIL);
-		/*
+	/*
 	 * Create a tuple descriptor from the relation schema.  Note that this
 	 * deals with column names, types, and NOT NULL constraints, but not
 	 * default values or CHECK constraints; we handle those below.
@@ -18313,7 +18325,8 @@ Oid DefineArchiveRelation(Relation rel)
 										  InvalidOid,
 										  NULL
 										  );
-										  	/* receive new history table address */
+
+	/* receive new history table address */
 	ObjectAddressSet(address, RelationRelationId, relationId);
 	/* set null toast options for history table */
 	toast_options = (Datum) 0;

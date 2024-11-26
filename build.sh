@@ -1,8 +1,5 @@
-cd
-pgsql/bin/pg_ctl -D pgdata -o "-p 5444" stop
 rm -rf /home/hututuzi/pgsql
 mkdir /home/hututuzi/pgsql
-cd WorkSpace/postgres
 make clean
 ./configure --prefix=/home/hututuzi/pgsql/ --enable-debug --enable-depend --enable-cassert CFLAGS=-O0
 make -j18 
@@ -12,4 +9,6 @@ rm -rf /home/hututuzi/pgdata
 mkdir /home/hututuzi/pgdata
 cd
 pgsql/bin/initdb -D pgdata
-pgsql/bin/pg_ctl -D pgdata -o "-p 5444" start
+pgsql/bin/pg_ctl -D pgdata start
+
+# pgsql/bin/psql -h localhost -d postgres
