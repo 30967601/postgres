@@ -2440,6 +2440,44 @@ xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
 	return false;
 }
 
+void heap_delete_backup(Relation rel, HeapTuple tuple) {
+    Oid backupTableOid = rel->rd_rel->relbackup;
+    if (OidIsValid(backupTableOid)) {
+        // 打开备份表
+        Relation backupRel = table_open(backupTableOid, RowExclusiveLock);
+
+        // 获取备份表的 tuple descriptor
+        TupleDesc backupDesc = RelationGetDescr(backupRel);
+		// 获取备份表列的数量
+		int natts = backupDesc->natts; 
+    
+	    // 备份原始数据
+        Datum *values = (Datum *) palloc((natts + 1) * sizeof(Datum));
+        bool *nulls = (bool *) palloc((natts + 1) * sizeof(bool));
+        int i;
+
+        // 复制原始元组的值
+        for (i = 0; i < natts-1; i++) {
+            values[i] = heap_getattr(tuple, i+1, RelationGetDescr(rel), &nulls[i]);
+        }
+
+        // 添加当前时间戳列（假设时间戳列是最后一列）
+        values[natts-1] = GetCurrentTimestamp();
+        nulls[natts-1] = false;  // 确保时间戳列不为空
+
+        // 创建备份元组
+        HeapTuple backupTuple = heap_form_tuple(backupDesc, values, nulls);
+
+        // 插入备份元组到备份表
+        heap_insert(backupRel, backupTuple, GetCurrentCommandId(false), 0,NULL);
+
+        // 释放备份元组和关闭备份表
+        heap_freetuple(backupTuple);
+        table_close(backupRel, RowExclusiveLock);
+    }
+}
+
+
 /*
  *	heap_delete - delete a tuple
  *
@@ -2508,6 +2546,8 @@ heap_delete(Relation relation, ItemPointer tid,
 	tp.t_len = ItemIdGetLength(lp);
 	tp.t_self = *tid;
 
+	// 在删除之前备份当前元组
+    heap_delete_backup(relation, &tp);
 l1:
 	/*
 	 * If we didn't pin the visibility map page and the page has become all
