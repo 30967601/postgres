@@ -18094,37 +18094,40 @@ void ATExecEnableDeleteBackup(Relation rel)
 
 	backupTableOid = DefineArchiveRelation(rel);
 	
-	rel->rd_rel->relbackup = backupTableOid;
+	// rel->rd_rel->relbackup = backupTableOid;
 
-	backup_open = table_open(backupTableOid, AccessExclusiveLock);
+	// backup_open = table_open(backupTableOid, AccessExclusiveLock);
 
-	table_close(backup_open, AccessExclusiveLock);
+	// table_close(backup_open, AccessExclusiveLock);
 	//  backup_open = table_open(backupTableOid,RowExclusiveLock);
 
-	// relid = RelationGetRelid(rel);
+	relid = RelationGetRelid(rel);
 
-	// pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 
-	// /* 修改 pg_class，设置 relbackup 字段 */
-	// classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
-	// if (!HeapTupleIsValid(classTup))
-	// 	elog(ERROR, "cache lookup failed for relation %u", relid);
+	/* 修改 pg_class，设置 relbackup 字段 */
+	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(classTup))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
 
-	// ((Form_pg_class)GETSTRUCT(classTup))->relbackup = backupTableOid;
+	((Form_pg_class)GETSTRUCT(classTup))->relbackup = backupTableOid;
 
-	// Assert(OidIsValid(backupTableOid));
+	Assert(OidIsValid(backupTableOid));
 
-	// /* 更新 pg_class */
-	// CatalogTupleUpdate(pg_class, &classTup->t_self, classTup);
+	/* 更新 pg_class */
+	CatalogTupleUpdate(pg_class, &classTup->t_self, classTup);
 
-	// /* 释放内存 */
-	// table_close(pg_class, RowExclusiveLock);
-	// heap_freetuple(classTup);
+	/* 释放内存 */
+	table_close(pg_class, RowExclusiveLock);
+	heap_freetuple(classTup);
 }
 
 static void ATExecDisableDeleteBackup(Relation rel){
 	Oid backupTableOid;
 	HeapTuple classTup;
+	Relation	pg_class;
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 
 	/* 检查是否启用了 DELETEBACKUP */
 	backupTableOid = rel->rd_rel->relbackup;
@@ -18140,18 +18143,21 @@ static void ATExecDisableDeleteBackup(Relation rel){
 	ObjectAddress backupTableAddr = {RelationRelationId, backupTableOid};
 	performDeletion(&backupTableAddr, DROP_CASCADE, 0);
 
-	// /* 修改 pg_class 清空 relbackup 字段 */
-	// classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
-	// if (!HeapTupleIsValid(classTup))
-	// 	elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(rel));
 
-	// ((Form_pg_class)GETSTRUCT(classTup))->relbackup = InvalidOid;
+	/* 修改 pg_class 清空 relbackup 字段 */
+	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
+	if (!HeapTupleIsValid(classTup))
+		elog(ERROR, "cache lookup failed for relation %u", RelationGetRelid(rel));
 
-	// /* 更新 pg_class */
-	// CatalogTupleUpdate(RelationGetRelid(rel), &classTup->t_self, classTup);
 
-	// /* 释放内存 */
-	// heap_freetuple(classTup);
+	((Form_pg_class)GETSTRUCT(classTup))->relbackup = InvalidOid;
+
+	/* 更新 pg_class */
+	CatalogTupleUpdate(pg_class, &classTup->t_self, classTup);
+
+	/* 释放内存 */
+	table_close(pg_class, RowExclusiveLock);
+	heap_freetuple(classTup);
 }
 Oid
 DefineArchiveRelation(Relation rel)
@@ -18188,7 +18194,7 @@ DefineArchiveRelation(Relation rel)
 	/*
 	 * Create the history table name
 	 */
-	snprintf(relname, sizeof(relname), "pg_backup");
+	snprintf(relname, sizeof(relname), "pg_backup_01");
 
 	/* current table and history table should be in the same namespace */
 	namespaceId = RelationGetNamespace(rel);
