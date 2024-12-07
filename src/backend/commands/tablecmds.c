@@ -18093,13 +18093,6 @@ void ATExecEnableDeleteBackup(Relation rel)
 	Oid			relid;
 
 	backupTableOid = DefineArchiveRelation(rel);
-	
-	// rel->rd_rel->relbackup = backupTableOid;
-
-	// backup_open = table_open(backupTableOid, AccessExclusiveLock);
-
-	// table_close(backup_open, AccessExclusiveLock);
-	//  backup_open = table_open(backupTableOid,RowExclusiveLock);
 
 	relid = RelationGetRelid(rel);
 

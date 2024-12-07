@@ -1,0 +1,38 @@
+启动：
+cd
+mkdir ~/pgsql
+cd postgres
+make clean
+./configure --prefix=/home/hututuzi/pgsql/ --enable-debug --enable-depend --enable-cassert CFLAGS=-O0
+make
+make check
+make install
+ (如果有pgdata了就需要执行这个)
+rm -rf ~/pgdata
+mkdir ~/pgdata
+cd
+pgsql/bin/initdb -D pgdata
+pgsql/bin/pg_ctl -D pgdata start
+pgsql/bin/psql -h localhost -d postgres
+
+可能需要的包：
+sudo apt install pkg-config
+sudo apt install libreadline-dev
+sudo apt-get install zlib1g-dev
+sudo apt-get update
+sudo apt-get install --fix-missing
+sudo apt install bison
+sudo apt-get install flex
+sudo apt-get install vim
+
+source .bashrc 
+ .bashrc 配置
+PATH=$PATH:/home/hututuzi/pgsql/bin
+PATH=$PATH:/home/hututuzi/pgsql/include
+PATH=$PATH:/home/hututuzi/pgsql/lib
+PATH-$PATH:/home/hututuzi/pgsql/share
+
+create table tbl (id int);
+drop table tbl;
+
+sudo apt install -y libsystemd-dev libxml2-dev libssl-dev libicu-dev zlib1g-dev libreadline-dev pkg-config
